@@ -1,0 +1,58 @@
+
+
+libdcwsocket -- Dual-channel Wi-Fi control/signalling socket library.
+
+
+This library is used to receive and transmit DCW control/signalling packets on
+the primary channel interface.
+
+
+
+API Usage Examples:
+
+  . To open a DCW control socket and listen for packets:
+
+    #include <dcwsocket.h>
+    #include <stdio.h>
+
+    static void
+    dump_buf(const unsigned char * buf, unsigned size) {
+      fprintf(stderr, "dump_buf:");
+      for(; size--; buf++) {
+        fprintf(stderr, " %02hX", (unsigned short)*buf);
+      }
+      fprintf(stderr, "\n");
+    }
+
+    void example_dcw_recv_test( void ) {
+      dcw_socket_t s;
+      unsigned char buf[10240];
+      int rv;
+
+      s = dcwsock_open("wlan0");
+      if (s == NULL) return; /* failed */
+
+      /* wait forever to receive a DCW message on interface "wlan0" */
+      rv = dcwsock_recv(s, buf, sizeof(buf));
+      if (rv == -1) {
+        dcwsock_close(s);
+        return; /* failed */
+      }
+
+      /* dump the raw contents (hex) of the received message */
+      dump_buf(buf, (unsigned)rv);
+
+      /* cleanup */
+      dcwsock_close(s);
+    }
+
+
+
+
+
+BUILDING:
+To generate autoconf files:
+ $ autoreconf --install
+
+
+

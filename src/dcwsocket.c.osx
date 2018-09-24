@@ -1,0 +1,265 @@
+#include "./dcwsocket.h"
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <ifaddrs.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <net/if_types.h>
+#include <net/if_dl.h>
+#include <net/ndrv.h>
+
+
+
+#define ETHER_HEADERSIZE  14
+#define CL3_HEADERSIZE    4
+#define MAX_PAYLOAD       (1500 - CL3_HEADERSIZE)
+#define MAX_FRAMESIZE     (MAX_PAYLOAD + ETHER_HEADERSIZE)
+#define DCW_ETHER_TYPE    0xB4E3
+#define MIN_FRAMESIZE     64
+
+
+
+
+
+struct dcw_socket {
+  int fd;
+  char ifmacaddr[6];
+};
+
+
+static int
+populate_macaddr(dcw_socket_t s, const char * const ifname) {
+  struct ifaddrs *ifap, *i;
+  if (getifaddrs(&ifap) == -1) {
+    perror("getifaddrs() failed");
+    return 0; /* failed */
+  }
+
+  for (i = ifap; i != NULL; i = i->ifa_next) {
+    if (strcmp(i->ifa_name, ifname) != 0) continue;
+    if (i->ifa_addr->sa_family != AF_LINK) continue;
+    memcpy(s->ifmacaddr, LLADDR((const struct sockaddr_dl *)i->ifa_addr), sizeof(s->ifmacaddr));
+    freeifaddrs(ifap);
+    return 1; /* success */
+  }
+
+  freeifaddrs(ifap);
+  return 0; /* failed */
+}
+
+dcw_socket_t
+dcwsock_open(const char * const ifname) {
+  dcw_socket_t               rv;
+  struct ndrv_demux_desc     dmx_desc;
+  struct ndrv_protocol_desc  proto_desc;
+  struct sockaddr_ndrv       snd;
+
+  /* allocate our socket struct */
+  rv = malloc(sizeof(*rv));
+  if (rv == NULL) {
+    perror("malloc(dcw_socket_t) failed");
+    goto failed;
+  }
+
+  /* sanitize our data structs... defensive */
+  bzero(rv, sizeof(*rv));
+  bzero(&dmx_desc, sizeof(dmx_desc));
+  bzero(&proto_desc, sizeof(proto_desc));
+  bzero(&snd, sizeof(snd));
+
+  /* open a "NDRV" socket... */
+  rv->fd = socket(PF_NDRV, SOCK_RAW, 0);
+  if (rv->fd == -1) {
+    perror("socket(PF_NDRV, SOCK_RAW, 0) failed");
+    goto failed;
+  }
+
+  /* bind the socket to the given interface... */
+  snd.snd_len     = sizeof(snd);
+  snd.snd_family  = AF_NDRV;
+  strncpy((char*)snd.snd_name, ifname, sizeof(snd.snd_name));
+  if (bind(rv->fd, (void*)&snd, sizeof(snd)) == -1) {
+    perror("bind() failed");
+    goto failed;
+  }
+
+  /* setup our ethertype filter... */
+  dmx_desc.type            = NDRV_DEMUXTYPE_ETHERTYPE;
+  dmx_desc.length          = sizeof(dmx_desc.data.ether_type);
+  dmx_desc.data.ether_type = htons(DCW_ETHER_TYPE);
+  proto_desc.version          = NDRV_PROTOCOL_DESC_VERS;
+  proto_desc.protocol_family  = NDRV_DEMUXTYPE_ETHERTYPE;
+  proto_desc.demux_count      = 1;
+  proto_desc.demux_list       = &dmx_desc;
+  if (setsockopt(rv->fd, SOL_NDRVPROTO, NDRV_SETDMXSPEC, (void*)&proto_desc, sizeof(proto_desc)) == -1) {
+    perror("setsockopt(SOL_NDRVPROTO, NDRV_SETDMXSPEC) failed");
+    goto failed;
+  }
+
+  /* populate the MAC address */
+  if (!populate_macaddr(rv, ifname)) {
+    perror("populate_macaddr() failed");
+    goto failed;
+  }
+
+  return rv; /* success */
+
+failed:
+  dcwsock_close(rv);
+  return NULL;
+}
+
+void
+dcwsock_close(dcw_socket_t s) {
+  if (s != NULL) {
+    close(s->fd);
+    free(s);
+  }
+}
+
+
+static const unsigned char
+_cl3_header[] = {
+  0x11,        /* first nybble = version (1); second nybble = header size (1 = 4 bytes) */
+  0x00,        /* RFU */
+  0x00, 0xDC   /* DCW protocol id = 0x00DC */
+};
+
+int
+dcwsock_send( dcw_socket_t s, const void * const buf, const unsigned buf_size, const unsigned char * const dest_macaddr ) {
+  char txbuf[MAX_FRAMESIZE];
+  ssize_t rv;
+  size_t write_size;
+  size_t overhead_size; /* ethernet header + CL3 header + padding */
+  struct sockaddr_dl sdl;
+
+  if (buf_size > MAX_PAYLOAD) {
+    fprintf(stderr, "Can not send a DCW message > %u bytes!\n", MAX_PAYLOAD);
+    return -1;
+  }
+
+  /* populate the 14-byte ethernet II frame header... */
+  /* destination MAC address */
+  if (dest_macaddr == NULL) {
+    /* no destination specified... goto broadcast by default */
+    memset(txbuf, 0xFF, 6);
+  }
+  else {
+    memcpy(txbuf, dest_macaddr, 6);
+  }
+  /* source MAC address */
+  memcpy(&txbuf[6], s->ifmacaddr, sizeof(s->ifmacaddr));
+  /* ethernet type */
+  txbuf[12] = (DCW_ETHER_TYPE >> 8);
+  txbuf[13] = (DCW_ETHER_TYPE & 0xFF);
+
+  /* populate the 4-byte CL3 header */
+  memcpy(&txbuf[14], _cl3_header, sizeof(_cl3_header));
+
+  /* copy the payload buffer */
+  memcpy(&txbuf[18], buf, buf_size);
+
+  /* do we have enough buffer to meet the minimum size? */
+  overhead_size = ETHER_HEADERSIZE + CL3_HEADERSIZE;
+  write_size = buf_size + overhead_size;
+  if (write_size < MIN_FRAMESIZE) {
+    /* pad the remainder of the packet with 0xFF's */
+    memset(&txbuf[write_size], 0xFF, MIN_FRAMESIZE - write_size);
+    overhead_size += MIN_FRAMESIZE - write_size;
+    write_size = MIN_FRAMESIZE;
+  }
+
+  /* OSX loves to be special...
+     fill out a link-level sockaddr cause we can only 
+     use sendto() with PF_NDRV...
+  */
+  bzero(&sdl, sizeof(sdl));
+  sdl.sdl_len   = sizeof(sdl);
+  sdl.sdl_index = 0;
+  sdl.sdl_type  = IFT_ETHER;
+  sdl.sdl_alen  = ETHER_ADDR_LEN;
+  memcpy(sdl.sdl_data, txbuf, 6);
+
+
+  /* fire it off... */
+  rv = sendto(s->fd, txbuf, write_size, 0, (void*)&sdl, sizeof(sdl));
+  if (rv == -1) return -1;
+  if (rv < overhead_size) return 0;
+  return (rv - overhead_size);
+}
+
+static const unsigned char _bcast_macaddr[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+int
+dcwsock_recv( dcw_socket_t s, void * const buf, const unsigned buf_size, unsigned char * const src_macaddr ) {
+  ssize_t rv;
+  char rxbuf[MAX_FRAMESIZE];
+  unsigned short cl3_protocol;
+  unsigned short cl3_header_len;
+
+  cl3_protocol   = 0;
+  cl3_header_len = 0;
+
+  /* get a frame from the kernel */
+  rv = read(s->fd, rxbuf, sizeof(rxbuf));
+  if (rv == -1) {
+    perror("DCW read() failed");
+    return -1;
+  }
+  if (rv < 14) return -1; /* something is really screwed at this point */
+
+  /* populate sender if requested */
+  if (src_macaddr != NULL) {
+    memcpy(src_macaddr, rxbuf + 6, 6);
+  }
+
+  /* is this frame destined for us? */
+  if (memcmp(rxbuf, s->ifmacaddr, sizeof(s->ifmacaddr)) != 0) {
+    /* no... ok.. broadcast? */
+    if (memcmp(rxbuf, _bcast_macaddr, sizeof(_bcast_macaddr)) != 0) {
+      return 0; /* not for us... */
+    }
+  }
+
+  /* parse the CL3 header */
+  if (rv < 18) return 0; /* need at least 18-bytes; 14-bytes ethernet + 4-bytes minimum for CL3 header */
+  cl3_header_len  = (unsigned char)rxbuf[14];
+  cl3_header_len &= 0x0F;
+  cl3_header_len *= 4;
+
+  if (rv < (14 + cl3_header_len)) return 0; /* ensure that the captured packet include the entire CL3 header */
+  if (cl3_header_len < 4) return 0; /* something is corrupt... CL3 header must be at minimum 4-bytes... drop this packet */
+
+  cl3_protocol    = (unsigned char)rxbuf[16];
+  cl3_protocol  <<= 8;
+  cl3_protocol   |= (unsigned char)rxbuf[17];
+
+  /* not the best for performance here, but we aint targeting packets 
+     firing along at blazing speeds */
+  rv -= 14;              /* deduct the ethernet header */
+  rv -= cl3_header_len;  /* deduct the cl3 header */
+  if (rv > buf_size) rv = buf_size;
+  memcpy(buf, rxbuf + 14 + cl3_header_len, rv);
+  return rv;
+}
+
+
+void dcwsock_get_macaddr(dcw_socket_t s, unsigned char * const output) {
+  memcpy(output, s->ifmacaddr, sizeof(s->ifmacaddr));
+}
+
+int dcwsock_get_fd(dcw_socket_t s) {
+  return s->fd;
+}
+
+
+
+
