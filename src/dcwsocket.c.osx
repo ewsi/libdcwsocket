@@ -90,10 +90,10 @@ dcwsock_open(const char * const ifname) {
   }
 
   /* sanitize our data structs... defensive */
-  bzero(rv, sizeof(*rv));
-  bzero(&dmx_desc, sizeof(dmx_desc));
-  bzero(&proto_desc, sizeof(proto_desc));
-  bzero(&snd, sizeof(snd));
+  memset(rv, 0, sizeof(*rv));
+  memset(&dmx_desc, 0, sizeof(dmx_desc));
+  memset(&proto_desc, 0, sizeof(proto_desc));
+  memset(&snd, 0, sizeof(snd));
 
   /* open a "NDRV" socket... */
   rv->fd = socket(PF_NDRV, SOCK_RAW, 0);
@@ -201,7 +201,7 @@ dcwsock_send( dcw_socket_t s, const void * const buf, const unsigned buf_size, c
      fill out a link-level sockaddr cause we can only 
      use sendto() with PF_NDRV...
   */
-  bzero(&sdl, sizeof(sdl));
+  memset(&sdl, 0, sizeof(sdl));
   sdl.sdl_len   = sizeof(sdl);
   sdl.sdl_index = 0;
   sdl.sdl_type  = IFT_ETHER;
